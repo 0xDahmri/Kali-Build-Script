@@ -57,6 +57,89 @@ function update_os {
     fi
 }
 
+# === Function to add "alive" to .zshrc
+function add_alive_function {
+    echo "[*] Adding 'alive' function to ~/.zshrc..."
+
+    cat << 'EOF' >> ~/.zshrc
+
+# Live host scanner
+function alive {
+    if [[ -z "$1" ]]; then
+        echo "Usage: alive <CIDR>"
+    else
+        echo "[*] Scanning for live hosts in $1..."
+        nmap -sn "$1" -oG - | awk '/Up$/{print $2}' > AliveHosts.txt
+        echo "[+] Alive hosts saved to AliveHosts.txt"
+    fi
+}
+EOF
+
+    echo "[+] 'alive' function added."
+}
+
+# === Function to add "initial" to .zshrc
+function add_initial_function {
+    echo "[*] Adding 'initial' function to ~/.zshrc..."
+
+    cat << 'EOF' >> ~/.zshrc
+
+# Detailed Nmap scan
+function initial {
+    if [[ -z "$1" || -z "$2" ]]; then
+        echo "Usage: initial <CIDR> <filename>"
+    else
+        echo "[*] Running initial scan on $1, output to $2.nmap/.gnmap/.xml..."
+        nmap -sC -sV -vv "$1" -oA "$2"
+        echo "[+] Scan complete. Output saved to $2.nmap, $2.gnmap, $2.xml"
+    fi
+}
+EOF
+
+    echo "[+] 'initial' function added."
+}
+
+# === Function to add "venvclone" to .zshrc ===
+function add_venvclone_function {
+    echo "[*] Adding 'venvclone' function to ~/.zshrc..."
+
+    cat << 'EOF' >> ~/.zshrc
+
+# Clone + Python virtualenv setup
+function venvclone {
+    if [[ -z "$1" ]]; then
+        echo "Usage: venvclone <git_repo_url>"
+        return 1
+    fi
+
+    local repo_url="$1"
+    local repo_name=$(basename "$repo_url" .git)
+
+    echo "[*] Cloning $repo_url..."
+    git clone "$repo_url" || return 1
+
+    cd "$repo_name" || return 1
+    echo "[*] Setting up virtual environment in $PWD..."
+
+    python3 -m venv .venv && \\
+    source .venv/bin/activate && \\
+    echo "[*] Upgrading pip..." && \\
+    pip install --upgrade pip
+
+    if [[ -f requirements.txt ]]; then
+        echo "[*] Installing requirements..."
+        pip install -r requirements.txt
+    else
+        echo "[!] No requirements.txt found. Skipping."
+    fi
+
+    echo "[+] Virtual environment is active. Ready to hack 🐍"
+}
+EOF
+
+    echo "[+] 'venvclone' added to ~/.zshrc"
+}
+
 #██████╗ ███████╗██████╗ ███████╗███╗   ██╗██████╗ ███████╗███╗   ██╗ ██████╗██╗███████╗███████╗        ██╗    ██╗      █████╗ ███╗   ██╗ ██████╗ ██╗   ██╗ █████╗  ██████╗ ███████╗███████╗
 #██╔══██╗██╔════╝██╔══██╗██╔════╝████╗  ██║██╔══██╗██╔════╝████╗  ██║██╔════╝██║██╔════╝██╔════╝       ██╔╝    ██║     ██╔══██╗████╗  ██║██╔════╝ ██║   ██║██╔══██╗██╔════╝ ██╔════╝██╔════╝
 #██║  ██║█████╗  ██████╔╝█████╗  ██╔██╗ ██║██║  ██║█████╗  ██╔██╗ ██║██║     ██║█████╗  ███████╗      ██╔╝     ██║     ███████║██╔██╗ ██║██║  ███╗██║   ██║███████║██║  ███╗█████╗  ███████╗
@@ -108,11 +191,31 @@ function configure_firefox {
 #   ╚═╝    ╚═════╝  ╚═════╝ ╚══════╝╚══════╝
 #                                           
 
-# === Ncat ===
+# === ncat ===
 function install_ncat {
     echo "[*] Installing Ncat via Nmap..."
     (sudo DEBIAN_FRONTEND=noninteractive apt install nmap -y &&
      echo -e "${SUCCESS}[+]${ENDCOLOR} Ncat installed") || echo -e "${ERROR}[-]${ENDCOLOR} Ncat installation failed"
+}
+
+# === sshuttle ===
+function install_sshuttle {
+    echo "[*] Installing sshuttle..."
+    if sudo apt install -y sshuttle >/dev/null 2>&1; then
+        echo "[+] sshuttle installed."
+    else
+        echo "[!] Failed to install sshuttle."
+    fi
+}
+
+# === sshpass ===
+function install_sshpass {
+    echo "[*] Installing sshpass..."
+    if sudo apt install -y sshpass >/dev/null 2>&1; then
+        echo "[+] sshpass installed."
+    else
+        echo "[!] Failed to install sshpass."
+    fi
 }
 
 # === ProjectDiscovery Tools ===
@@ -342,12 +445,17 @@ function build {
     fix_kali_gpg_key
     fix_locales_and_fonts
     update_os
+	add_alive_function
+	add_initial_function
+	add_venvclone_function
 	# Dependencies / Languages
     update_wordlists
 	configure_firefox
     install_golang
 	# Tools
     install_ncat
+	install_sshuttle
+	install_sshpass
     install_projectdiscovery_tools
 	install_gowitness
     install_massdns
