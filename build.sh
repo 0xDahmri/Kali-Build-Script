@@ -16,6 +16,14 @@ ERROR="\e[1;31m"
 SUCCESS="\e[1;32m"
 ENDCOLOR="\e[0m"
 
+# === Enable global Python argcomplete (Tab completion is broken in the 2025.1 Kali build) ===
+if command -v activate-global-python-argcomplete >/dev/null 2>&1; then
+    echo "[*] Enabling global Python argcomplete..."
+    sudo activate-global-python-argcomplete >/dev/null 2>&1 && \
+        echo "[+] Argcomplete enabled." || \
+        echo "[!] Failed to enable argcomplete."
+fi
+
 # === Log File Setup ===
 # The goal here is to have a full set of logs for attribution and/or troubleshooting purposes.  A relic from being on a DoD red team, but a good mindset to have.
 LOG_FILE="$HOME/build_log.txt"
