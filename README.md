@@ -12,7 +12,7 @@ A lightweight script that transforms a fresh Kali Linux VM into a CTF-ready pent
 - **Centralized Logging**  
   - Configures Filebeat → Logstash → Elasticsearch  
 - **Shell Recon Helpers**  
-  - `alive` &ndash; fast ICMP ping sweep  
+  - `alive` &ndash; ping sweep  
   - `initial` &ndash; default Nmap scan (`-sC -sV -vv`) with custom input/output  
   - `venvclone` &ndash; clone a Git repo and spin up a Python virtualenv  
 - **Wordlist Refresh**  
@@ -29,12 +29,12 @@ A lightweight script that transforms a fresh Kali Linux VM into a CTF-ready pent
 - `sshpass`  
 - `golang-go`  
 - `firefox-esr`  
-- **FoxyProxy Standard** (Firefox extension)  
-- `pdtm` (ProjectDiscovery Tools Manager)  
+- `FoxyProxy Standard (Firefox extension)`  
+- `pdtm (ProjectDiscovery Tools Manager)`  
 - `GoWitness`  
 - `massdns`  
 - `kerbrute`  
-- **Sliver** (`sliver-server` & `sliver-client`)  
+- `Sliver`  
 - `elasticsearch`  
 - `kibana`  
 - `logstash`  
