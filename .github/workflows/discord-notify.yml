@@ -1,40 +1,33 @@
 name: Notify Discord on Push
-
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 jobs:
   discord:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Build payload
-        id: build
+      - name: Build JSON payload
         run: |
-          PAYLOAD=$(
-            jq -n \
-              --arg user "${{ github.actor }}" \
-              --arg repo "${{ github.repository }}" \
-              --arg url "${{ github.event.compare }}" \
-              '{
-                "username": "GitHub Bot",
-                "embeds": [
-                  {
-                    "title": "🔄 Push to \($repo)",
-                    "description": "By **\($user)**\nSee changes: <\($url)>",
-                    "color": 15258703,
-                    "timestamp": "\(now)"
-                  }
-                ]
-              }'
-          )
-          echo "::set-output name=payload::$PAYLOAD"
+          cat <<EOF > payload.json
+          {
+            "username": "GitHub Bot",
+            "embeds": [
+              {
+                "title": "🔄 Push to ${{ github.repository }}",
+                "description": "By **${{ github.actor }}**\nSee changes: <${{ github.event.compare }}>",
+                "color": 15258703,
+                "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              }
+            ]
+          }
+          EOF
 
       - name: Send to Discord
-        run: |
-          curl -X POST "$WEBHOOK" \
-            -H "Content-Type: application/json" \
-            -d "${{ steps.build.outputs.payload }}"
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          curl -v -X POST "${WEBHOOK}" \
+            -H "Content-Type: application/json" \
+            -d @payload.json
