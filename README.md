@@ -1,13 +1,25 @@
 # Kali Build Script
 
-A simple script to stand up CTF boxes on Kali, with minimal fuss. It:
+A lightweight script that transforms a fresh Kali Linux VM into a CTF-ready pentesting environment.
 
-- Runs system updates and upgrades  
-- Configures centralized logging  
-- Adds handy recon functions to your shell  
-- Refreshes common wordlists  
-- Installs dependencies and tools  
-- Deploys an ELK stack for data visualization  
+---
+
+## 🚀 Features
+
+- **System Maintenance**  
+  - Runs `apt update && apt upgrade`  
+  - Rebuilds locale and font caches  
+- **Centralized Logging**  
+  - Configures Filebeat → Logstash → Elasticsearch  
+- **Shell Recon Helpers**  
+  - `alive` &ndash; fast ICMP ping sweep  
+  - `initial` &ndash; default Nmap scan (`-sC -sV -vv`) with custom input/output  
+  - `venvclone` &ndash; clone a Git repo and spin up a Python virtualenv  
+- **Wordlist Refresh**  
+  - Pulls the latest SecLists into `/usr/share/seclists`  
+- **ELK Stack Deployment**  
+  - Elasticsearch, Kibana, Logstash, Filebeat  
+  - `logstash-codec-nmap` plugin for parsing Nmap XML  
 
 ---
 
@@ -27,4 +39,10 @@ A simple script to stand up CTF boxes on Kali, with minimal fuss. It:
 - `kibana`  
 - `logstash`  
 - `filebeat`  
-- `logstash-codec-nmap` (Logstash plugin)  
+- `logstash-codec-nmap`  
+
+---
+
+## ⚙️ Usage
+
+**Do not run as sudo!**  
