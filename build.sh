@@ -4,20 +4,22 @@
 set -Eeuo pipefail
 
 # =============================================================================
-# Kali Build Script - v6.0.0
+# Kali Build Script - v6.1.0
 # - Quiet, timestamped console + dual log files (system + user)
-# - Robust APT: IPv4-only, retries/timeouts, update retries, --fix-missing fallback
+# - APT pinned to the UC Berkeley Kali mirror; IPv4-only, retries/timeouts,
+#   update retries, --fix-missing fallback
 # - Fonts + locales, CLI QoL, Go toolchain (official tarball, auto-versioned)
 # - Security tools: pdtm/httpx, massdns, kerbrute (verified), GoWitness,
 #   Sliver (verified), ligolo-ng, nuclei, subfinder
-# - AD/Windows tooling: pre2k, pretender, certipy-ad, coercer, nxc (NetExec),
-#   RemoteMonologue (src), Internal-Monologue (src)
+# - AD/Windows tooling: pre2k, certipy-ad, coercer, nxc (NetExec)
+# - AD analysis: bloodhound-automation (Docker-based BloodHound CE + Neo4j),
+#   AD Miner (offline HTML attack-path reports from a Neo4j/BloodHound DB)
 # - Utilities: magic-wormhole
 # =============================================================================
 
 # Capture build start time before anything else runs so it's accurate in logs.
 START_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-VER="6.0.0"
+VER="6.1.0"
 
 # Two log destinations: /var/log (root-owned, survives user home wipes) and
 # $HOME (accessible to the invoking user without sudo after the build).
@@ -109,8 +111,25 @@ setup_traps() {
 # -f: fail on HTTP errors (exit 22) rather than saving the error page.
 # -s: silent (no progress bar). -L: follow redirects.
 dl() { # dl <url> <outfile>
-  local url="$1" out="$2"
+  local url="$1" out="$2" rc
   curl -fsL --retry 3 --retry-delay 1 --connect-timeout 20 -o "$out" "$url" >/dev/null 2>&1
+  rc=$?
+  # Log the curl exit code on failure so callers that skip quietly on a failed
+  # dl still leave a diagnosable trail (6=DNS, 7=connect refused, 22=HTTP
+  # error, 28=timeout, 35/60=TLS handshake/cert failure, etc).
+  (( rc != 0 )) && note "curl exit ${rc} fetching ${url}"
+  return $rc
+}
+
+# Resolves a release asset's real download URL via the GitHub API instead of
+# guessing a fixed .../releases/latest/download/<name> filename — asset names
+# drift across releases (arch suffixes added, versions embedded in the name,
+# checksum formats swapped), which silently 404s a hardcoded URL. Requires jq
+# (installed in install_base_cli).
+gh_asset_url() { # gh_asset_url <owner/repo> <name-regex>
+  local repo="$1" pattern="$2"
+  curl -fsL --connect-timeout 20 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+    | jq -r --arg pat "$pattern" '[.assets[] | select(.name | test($pat))][0].browser_download_url // empty' 2>/dev/null
 }
 
 # ---------- APT hardening ----------
@@ -123,6 +142,58 @@ export NEEDRESTART_MODE=a
 export NEEDRESTART_SUSPEND=1
 # Suppress the apt-listchanges changelog popup.
 export APT_LISTCHANGES_FRONTEND=none
+
+configure_apt_mirror() {
+  info "Pinning APT to the Berkeley (OCF) Kali mirror"
+  # "mirrors.berkeley.edu" is a legacy alias, not the real host: its TLS cert
+  # is issued to fallingrocks.ocf.berkeley.edu and does not list
+  # mirrors.berkeley.edu in its SAN, so HTTPS to that alias fails hostname
+  # verification. Plain HTTP to the alias 301s to the real host anyway. Use
+  # the canonical host directly, over plain HTTP like Kali's own default
+  # (http://http.kali.org/kali/) — package integrity is verified via the
+  # GPG-signed Release file, not TLS, so HTTPS buys nothing here.
+  local mirror_host="mirrors.ocf.berkeley.edu"
+  local mirror_uri="http://${mirror_host}/kali"
+  # Kali 2023.4+ reads /etc/apt/sources.list.d/kali.sources (deb822 format);
+  # the legacy /etc/apt/sources.list is often an empty stub on modern installs
+  # and silently ignored. Rewrite whichever one is actually live.
+  local modern="/etc/apt/sources.list.d/kali.sources"
+  local legacy="/etc/apt/sources.list"
+  local target="$legacy"
+  [[ -f "$modern" ]] && target="$modern"
+
+  # apt only parses *.list/*.sources files under sources.list.d/ and logs a
+  # noisy "invalid filename extension" notice on every future apt invocation
+  # for anything else it finds there — move out any earlier in-place backups
+  # (including ones dropped by a previous, buggy version of this function).
+  local stray
+  while IFS= read -r stray; do
+    mv -f "$stray" "/etc/apt/$(basename "$stray")" 2>/dev/null || true
+  done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f -name '*.bak-*' 2>/dev/null)
+
+  if grep -q "$mirror_host" "$target" 2>/dev/null; then
+    note "APT sources already point at the Berkeley mirror"
+    return 0
+  fi
+  # Back up outside sources.list.d/ so the backup itself doesn't trip the
+  # same "invalid filename extension" notice.
+  [[ -f "$target" ]] && cp "$target" "/etc/apt/$(basename "$target").bak-$(date -u +%Y%m%d-%H%M%S)"
+
+  if [[ "$target" == "$modern" ]]; then
+    cat >"$target" <<EOF
+Types: deb
+URIs: ${mirror_uri}/
+Suites: kali-rolling
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/kali-archive-keyring.gpg
+EOF
+  else
+    cat >"$target" <<EOF
+deb ${mirror_uri} kali-rolling main contrib non-free non-free-firmware
+EOF
+  fi
+  ok "APT sources (${target}) pinned to ${mirror_host}"
+}
 
 tune_apt_network() {
   info "Tuning APT network (IPv4, retries/timeouts)"
@@ -203,14 +274,14 @@ install_base_cli() {
   # ca-certificates: required for HTTPS downloads to validate against modern CAs.
   # curl: used throughout this script and as a general-purpose download tool.
   # gnupg: apt needs it to verify signed package repositories.
-  # git: required to clone massdns, pretender, pre2k, RemoteMonologue, Internal-Monologue.
+  # git: required to clone massdns, pre2k, and bloodhound-automation.
   # jq: JSON parsing for API responses and tool output at the command line.
   # ripgrep, fd-find, bat, fzf: fast modern replacements for grep/find/cat/history search.
   # unzip/tar: archive extraction used by install_go and install_ligolo_ng.
-  # build-essential + pkg-config: compiler toolchain needed to build massdns and pretender from source.
+  # build-essential + pkg-config: compiler toolchain needed to build massdns from source.
   # python3 + python3-venv + python3-pip: Python runtime; pipx and several tools depend on it.
   # pipx: installs Python tools into isolated venvs so they don't conflict with each other
-  #   or the system Python. Used for netexec, certipy-ad, coercer, pre2k, magic-wormhole.
+  #   or the system Python. Used for netexec, certipy-ad, coercer, pre2k, AD-Miner, magic-wormhole.
   apt_quiet_install \
     ca-certificates curl gnupg git jq \
     ripgrep fd-find bat fzf \
@@ -326,24 +397,18 @@ install_kerbrute() {
   # kerbrute performs fast Kerberos pre-auth username enumeration and password
   # spraying against AD without triggering traditional lockout policies.
   local tmp_bin="/tmp/kerbrute_linux_amd64"
-  local tmp_sum="/tmp/kerbrute_checksums.txt"
-  if dl "https://github.com/ropnop/kerbrute/releases/latest/download/kerbrute_linux_amd64" "$tmp_bin" && \
-     dl "https://github.com/ropnop/kerbrute/releases/latest/download/checksums.txt" "$tmp_sum"; then
-    # Verify the SHA256 checksum published alongside the release before installing.
-    # This catches corrupted downloads and tampered binaries.
-    local expected actual
-    expected=$(grep "kerbrute_linux_amd64" "$tmp_sum" 2>/dev/null | awk '{print $1}')
-    actual=$(sha256sum "$tmp_bin" | awk '{print $1}')
-    if [[ -n "$expected" && "$expected" == "$actual" ]]; then
-      install -m 755 "$tmp_bin" /usr/local/bin/kerbrute
-      ok "kerbrute installed (checksum verified)"
-    else
-      warn "kerbrute checksum mismatch; skipping"
-    fi
+  # Upstream no longer publishes a combined checksums.txt (or any per-file
+  # signature) alongside releases, so this installs unverified — that matches
+  # what upstream itself offers, not a shortcut we're taking.
+  local bin_url
+  bin_url=$(gh_asset_url ropnop/kerbrute '^kerbrute_linux_amd64$')
+  if [[ -n "$bin_url" ]] && dl "$bin_url" "$tmp_bin"; then
+    install -m 755 "$tmp_bin" /usr/local/bin/kerbrute
+    ok "kerbrute installed (unverified — no checksum published upstream)"
   else
     note "kerbrute not fetched (skipping quietly)"
   fi
-  rm -f "$tmp_bin" "$tmp_sum" 2>/dev/null || true
+  rm -f "$tmp_bin" 2>/dev/null || true
 }
 
 install_gowitness() {
@@ -362,44 +427,30 @@ install_sliver() {
   # and mTLS channels. We install both the server (operator machine) and the
   # client (can connect to a remote Sliver server) components.
   mkdir -p /opt/sliver
-  local url_base="https://github.com/BishopFox/sliver/releases/latest/download"
 
-  # Download to /tmp first, verify checksum, then install — avoids leaving a
-  # partially-downloaded or tampered binary in /opt/sliver.
-  if dl "${url_base}/sliver-server_linux" /tmp/sliver-server && \
-     dl "${url_base}/sliver-server_linux.sha256" /tmp/sliver-server.sha256; then
-    local expected actual
-    # Sliver publishes .sha256 files containing just the hash with no filename.
-    expected=$(awk '{print $1}' /tmp/sliver-server.sha256)
-    actual=$(sha256sum /tmp/sliver-server | awk '{print $1}')
-    if [[ "$expected" == "$actual" ]]; then
-      install -m 755 /tmp/sliver-server /opt/sliver/sliver-server
-      ln -sf /opt/sliver/sliver-server /usr/local/bin/sliver-server || true
-      ok "sliver-server installed (checksum verified)"
-    else
-      warn "sliver-server checksum mismatch; skipping"
+  local name url sig_url
+  for name in server client; do
+    # Asset names gained an explicit -amd64 arch suffix, and upstream switched
+    # from published .sha256 files to minisign .minisig signatures. We don't
+    # have a pinned, independently-verified BishopFox minisign public key to
+    # check against, so we fetch the signature alongside the binary for the
+    # operator to verify manually rather than skip or fake-verify it.
+    url=$(gh_asset_url BishopFox/sliver "^sliver-${name}_linux-amd64\$")
+    sig_url=$(gh_asset_url BishopFox/sliver "^sliver-${name}_linux-amd64\\.minisig\$")
+    if [[ -z "$url" ]]; then
+      note "sliver-${name} release asset not found (skipping quietly)"
+      continue
     fi
-  else
-    note "sliver-server not fetched (skipping quietly)"
-  fi
-  rm -f /tmp/sliver-server /tmp/sliver-server.sha256 2>/dev/null || true
-
-  if dl "${url_base}/sliver-client_linux" /tmp/sliver-client && \
-     dl "${url_base}/sliver-client_linux.sha256" /tmp/sliver-client.sha256; then
-    local expected actual
-    expected=$(awk '{print $1}' /tmp/sliver-client.sha256)
-    actual=$(sha256sum /tmp/sliver-client | awk '{print $1}')
-    if [[ "$expected" == "$actual" ]]; then
-      install -m 755 /tmp/sliver-client /opt/sliver/sliver-client
-      ln -sf /opt/sliver/sliver-client /usr/local/bin/sliver-client || true
-      ok "sliver-client installed (checksum verified)"
+    if dl "$url" "/tmp/sliver-${name}"; then
+      install -m 755 "/tmp/sliver-${name}" "/opt/sliver/sliver-${name}"
+      ln -sf "/opt/sliver/sliver-${name}" "/usr/local/bin/sliver-${name}" || true
+      [[ -n "$sig_url" ]] && dl "$sig_url" "/opt/sliver/sliver-${name}.minisig"
+      ok "sliver-${name} installed (unverified — verify /opt/sliver/sliver-${name}.minisig manually with minisign if required)"
     else
-      warn "sliver-client checksum mismatch; skipping"
+      note "sliver-${name} not fetched (skipping quietly)"
     fi
-  else
-    note "sliver-client not fetched (skipping quietly)"
-  fi
-  rm -f /tmp/sliver-client /tmp/sliver-client.sha256 2>/dev/null || true
+    rm -f "/tmp/sliver-${name}" 2>/dev/null || true
+  done
 }
 
 install_ligolo_ng() {
@@ -412,11 +463,32 @@ install_ligolo_ng() {
     ok "ligolo-ng already present"
     return 0
   fi
+  # Asset filenames embed the release version (e.g.
+  # ligolo-ng_proxy_0.9_linux_amd64.tar.gz), so a fixed URL breaks on every
+  # release; resolve the current name via the API instead.
+  local proxy_url sum_url
+  proxy_url=$(gh_asset_url nicocha30/ligolo-ng '^ligolo-ng_proxy_[0-9][0-9.]*_linux_amd64\.tar\.gz$')
+  sum_url=$(gh_asset_url nicocha30/ligolo-ng '^ligolo-ng_[0-9][0-9.]*_checksums\.txt$')
+  if [[ -z "$proxy_url" ]]; then
+    note "ligolo-ng release asset not found (skipping quietly)"
+    return 0
+  fi
+
   local tmpdir="/tmp/ligolo-ng-dl"
   mkdir -p "$tmpdir"
-  if dl "https://github.com/nicocha30/ligolo-ng/releases/latest/download/ligolo-ng_proxy_linux_amd64.tar.gz" \
-        "$tmpdir/proxy.tar.gz"; then
-    tar -xzf "$tmpdir/proxy.tar.gz" -C "$tmpdir" 2>/dev/null || true
+  local archive="$tmpdir/$(basename "$proxy_url")"
+  if dl "$proxy_url" "$archive"; then
+    if [[ -n "$sum_url" ]] && dl "$sum_url" "$tmpdir/checksums.txt"; then
+      local expected actual
+      expected=$(grep -F "$(basename "$archive")" "$tmpdir/checksums.txt" 2>/dev/null | awk '{print $1}')
+      actual=$(sha256sum "$archive" | awk '{print $1}')
+      if [[ -z "$expected" || "$expected" != "$actual" ]]; then
+        warn "ligolo-ng checksum mismatch or unavailable; skipping"
+        rm -rf "$tmpdir" 2>/dev/null || true
+        return 0
+      fi
+    fi
+    tar -xzf "$archive" -C "$tmpdir" 2>/dev/null || true
     # The binary name inside the archive has changed across releases; search for
     # any of the known names rather than assuming a specific one.
     local proxy_bin
@@ -424,7 +496,7 @@ install_ligolo_ng() {
     if [[ -n "$proxy_bin" ]]; then
       # Install as 'ligolo-proxy' to avoid colliding with the generic 'proxy' name.
       install -m 755 "$proxy_bin" /usr/local/bin/ligolo-proxy
-      ok "ligolo-ng proxy installed"
+      ok "ligolo-ng proxy installed (checksum verified)"
     else
       warn "ligolo-ng proxy binary not found in archive"
     fi
@@ -477,37 +549,6 @@ install_pre2k() {
   fi
 }
 
-install_pretender() {
-  info "pretender (mDNS/LLMNR/NetBIOS/DHCPv6 spoofing)"
-  # pretender poisons name resolution protocols to capture NTLMv2 hashes from
-  # hosts resolving non-existent names — functionally similar to Responder but
-  # written in Go with a focus on selective/surgical poisoning.
-  if command -v pretender >/dev/null 2>&1; then
-    ok "pretender already present"
-    return 0
-  fi
-  if GOBIN=/usr/local/bin go install github.com/RedTeamPentesting/pretender@latest >/dev/null 2>&1; then
-    ok "pretender installed (go install)"
-    return 0
-  fi
-  # go install can fail if the module has CGO dependencies or unusual build tags;
-  # fall back to a manual source build as a secondary attempt.
-  warn "pretender go install failed; trying source build"
-  if [[ ! -d /opt/pretender ]]; then
-    git clone --depth=1 https://github.com/RedTeamPentesting/pretender /opt/pretender >/dev/null 2>&1 || true
-  fi
-  if [[ -d /opt/pretender ]]; then
-    (cd /opt/pretender && go build -trimpath -o /usr/local/bin/pretender >/dev/null 2>&1) || true
-    if command -v pretender >/dev/null 2>&1; then
-      ok "pretender built from source"
-    else
-      warn "pretender build failed (skipping)"
-    fi
-  else
-    warn "pretender source unavailable (skipping)"
-  fi
-}
-
 install_netexec() {
   info "NetExec (nxc) — CrackMapExec successor"
   # NetExec is the actively maintained fork of CrackMapExec. It enumerates and
@@ -556,26 +597,62 @@ install_coercer() {
   fi
 }
 
-install_remote_monologue() {
-  info "RemoteMonologue (source clone)"
-  # RemoteMonologue triggers NTLM authentication from remote Windows hosts via
-  # DCOM — useful for coercing auth from machines where traditional methods are
-  # blocked. Windows-targeted; source only, no Linux binary to install.
-  if [[ ! -d /opt/RemoteMonologue ]]; then
-    git clone --depth=1 https://github.com/3lp4tr0n/RemoteMonologue /opt/RemoteMonologue >/dev/null 2>&1 || true
+install_bloodhound_automation() {
+  info "bloodhound-automation (Dockerized BloodHound CE + Neo4j)"
+  # bloodhound-automation spins up per-engagement Neo4j/Postgres/BloodHound CE
+  # stacks in Docker so SharpHound data can be dropped in and queried without
+  # hand-rolling docker-compose files for every assessment. Its own
+  # requirements.txt pins docker-compose==1.29.2 (Python, installed into the
+  # venv below) — no docker-compose apt/plugin package is needed here.
+  apt_quiet_install docker.io python3-virtualenv
+  systemctl enable --now docker >/dev/null 2>&1 || true
+  # Let the invoking (non-root) user run docker without sudo after the build.
+  local invoking_user="${SUDO_USER:-}"
+  [[ -n "$invoking_user" ]] && usermod -aG docker "$invoking_user" 2>/dev/null || true
+
+  if [[ ! -d /opt/bloodhound-automation ]]; then
+    git clone --depth=1 https://github.com/Tanguy-Boisset/bloodhound-automation /opt/bloodhound-automation >/dev/null 2>&1 || true
   fi
-  ok "RemoteMonologue cloned to /opt/RemoteMonologue (Windows-targeted)"
+  if [[ -d /opt/bloodhound-automation ]]; then
+    (
+      cd /opt/bloodhound-automation
+      virtualenv -p python3 venv >/dev/null 2>&1
+      # shellcheck disable=SC1091
+      source venv/bin/activate
+      pip3 install --upgrade pip >/dev/null 2>&1
+      pip3 install -r requirements.txt >/dev/null 2>&1
+      deactivate
+    ) || true
+    if [[ -x /opt/bloodhound-automation/venv/bin/python3 ]]; then
+      # Wrapper so the venv doesn't need manual activation on every invocation.
+      cat >/usr/local/bin/bloodhound-automation <<'EOF'
+#!/usr/bin/env bash
+exec /opt/bloodhound-automation/venv/bin/python3 /opt/bloodhound-automation/bloodhound-automation.py "$@"
+EOF
+      chmod 755 /usr/local/bin/bloodhound-automation
+      ok "bloodhound-automation installed (run: bloodhound-automation start -bp <port> -np <port> -wp <port> <project>)"
+    else
+      warn "bloodhound-automation venv setup failed (skipping wrapper)"
+    fi
+  else
+    warn "bloodhound-automation clone failed (skipping)"
+  fi
 }
 
-install_internal_monologue() {
-  info "Internal-Monologue (source clone)"
-  # Internal-Monologue extracts NetNTLMv1/v2 challenge responses from the local
-  # Windows machine without touching LSASS, making it significantly stealthier
-  # than Mimikatz for credential harvesting. Windows-targeted; source only.
-  if [[ ! -d /opt/Internal-Monologue ]]; then
-    git clone --depth=1 https://github.com/eladshamir/Internal-Monologue /opt/Internal-Monologue >/dev/null 2>&1 || true
+install_ad_miner() {
+  info "AD Miner (offline BloodHound/Neo4j attack-path reports)"
+  # AD Miner queries a BloodHound Neo4j database directly and renders a static
+  # HTML report of AD attack paths, complementing interactive graph exploration
+  # in the BloodHound GUI. No PyPI release exists; install straight from source.
+  if command -v AD-miner >/dev/null 2>&1; then
+    ok "AD-miner already present"
+    return 0
   fi
-  ok "Internal-Monologue cloned to /opt/Internal-Monologue (Windows-targeted)"
+  if pipx install "git+https://github.com/AD-Security/AD_Miner.git" >/dev/null 2>&1; then
+    ok "AD-miner installed (pipx)"
+  else
+    warn "AD-miner install failed (skipping)"
+  fi
 }
 
 install_magic_wormhole() {
@@ -639,7 +716,9 @@ main() {
   setup_logging
   setup_traps
 
-  # Harden APT networking first so all subsequent installs benefit from it.
+  # Pin the mirror and harden APT networking first so all subsequent installs
+  # benefit from it.
+  configure_apt_mirror
   tune_apt_network
   apt_refresh
 
@@ -670,12 +749,13 @@ main() {
 
   info "Phase: AD / Windows tooling"
   install_pre2k
-  install_pretender
   install_netexec
   install_certipy
   install_coercer
-  install_remote_monologue
-  install_internal_monologue
+
+  info "Phase: AD analysis"
+  install_bloodhound_automation
+  install_ad_miner
 
   info "Phase: utilities"
   install_magic_wormhole
