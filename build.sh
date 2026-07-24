@@ -4,14 +4,16 @@
 set -Eeuo pipefail
 
 # =============================================================================
-# Kali Build Script - v6.1.0
-# - Quiet, timestamped console + dual log files (system + user)
+# Kali Build Script - v6.3.0
+# - Quiet, timestamped, color-coded console + dual log files (system + user)
+# - End-of-run install summary table (tool/status/detail) on console + logs
 # - APT pinned to the UC Berkeley Kali mirror; IPv4-only, retries/timeouts,
 #   update retries, --fix-missing fallback
 # - Fonts + locales, CLI QoL, Go toolchain (official tarball, auto-versioned)
-# - Security tools: pdtm/httpx, massdns, kerbrute (verified), GoWitness,
-#   Sliver (verified), ligolo-ng, nuclei, subfinder
-# - AD/Windows tooling: pre2k, certipy-ad, coercer, nxc (NetExec)
+# - Security tools: pdtm/httpx, massdns, kerbrute, GoWitness, Sliver,
+#   ligolo-ng, nuclei, subfinder, SecLists
+# - AD/Windows tooling: pre2k, NetExec, Certipy, coercer, enum4linux-ng,
+#   mitm6, krbrelayx, SCCMHunter, LdapRelayScan, Talon (checksum-verified)
 # - AD analysis: bloodhound-automation (Docker-based BloodHound CE + Neo4j),
 #   AD Miner (offline HTML attack-path reports from a Neo4j/BloodHound DB)
 # - Utilities: magic-wormhole
@@ -19,7 +21,7 @@ set -Eeuo pipefail
 
 # Capture build start time before anything else runs so it's accurate in logs.
 START_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-VER="6.1.0"
+VER="6.3.0"
 
 # Two log destinations: /var/log (root-owned, survives user home wipes) and
 # $HOME (accessible to the invoking user without sudo after the build).
@@ -31,8 +33,14 @@ LOG_USER="${LOG_DIR_USER}/build-$(date -u +%Y%m%d-%H%M%S).log"
 LATEST_SYS="${LOG_DIR_SYS}/kali-build-latest.log"
 LATEST_USER="${LOG_DIR_USER}/build-latest.log"
 
+# Catch-all home for tools that are just loose scripts (no PyPI package, no
+# compiled release) — clone these here rather than /opt so they're easy for
+# the invoking user to browse, edit, or update by hand.
+TOOLS_DIR="$HOME/tools"
+
 # ---- colors ----
 RED=$'\033[31m'; YELLOW=$'\033[33m'; GREEN=$'\033[32m'; RESET=$'\033[0m'
+CYAN=$'\033[36m'; BLUE=$'\033[34m'; BOLD=$'\033[1m'; DIM=$'\033[2m'
 
 # ---- global printing control ----
 # LOGGING_READY gates whether console output uses fd 3 (real TTY, saved before
@@ -42,15 +50,34 @@ LOGGING_READY=0
 CONSOLE_FD=1
 CONSOLE_ERR_FD=2
 
+# ---- tool status tracking (for the end-of-run summary table) ----
+declare -A TOOL_STATUS=()
+declare -A TOOL_DETAIL=()
+TOOL_ORDER=()
+
+# mark <name> <OK|FAIL|SKIP> [detail] — records a tool's outcome for the
+# summary table printed at the end of the build. Safe to call more than once
+# per name (e.g. re-checked "already installed" paths); last call wins.
+mark() {
+  local name="$1" status="$2" detail="${3:-}"
+  [[ -z "${TOOL_STATUS[$name]+x}" ]] && TOOL_ORDER+=("$name")
+  TOOL_STATUS["$name"]="$status"
+  TOOL_DETAIL["$name"]="$detail"
+}
+
 # ---- helpers ----
-ts() { date -u +[%Y-%m-%dT%H:%M:%SZ]; }
+ts() { printf "${DIM}%s${RESET}" "$(date -u +[%Y-%m-%dT%H:%M:%SZ])"; }
 
 # Raw line formatters — prefixes only, no timestamp (timestamp is added by the caller).
-_note() { printf "    - %s\n" "$*"; }
-_info() { printf "[*] %s\n" "$*"; }
-_ok()   { printf "[+] %s\n" "$*"; }
+_note() { printf "${DIM}    - %s${RESET}\n" "$*"; }
+_info() { printf "${CYAN}[*]${RESET} %s\n" "$*"; }
+_ok()   { printf "${GREEN}[+]${RESET} %s\n" "$*"; }
 _warn() { printf "${YELLOW}[!]${RESET} %s\n" "$*"; }
 _err()  { printf "${RED}[x]${RESET} %s\n" "$*"; }
+
+# Bold banner for phase headers so major sections stand out in the console.
+_phase() { printf "\n${BOLD}${CYAN}==== %s ====${RESET}\n" "$*"; }
+phase() { if (( LOGGING_READY )); then { printf "%s " "$(ts)"; _phase "$@"; } >&3; else { printf "%s " "$(ts)"; _phase "$@"; }; fi; }
 
 # Console printers: write to fd 3 (saved TTY) once logging is active so these
 # messages appear on screen even though fd 1/2 are redirected to the log pipes.
@@ -305,6 +332,7 @@ install_browser_bits() {
   # The old automated XPI download broke when Mozilla changed their CDN.
   # Install FoxyProxy manually from the link below when first launching Firefox.
   ok "Firefox ESR installed; add FoxyProxy manually from addons.mozilla.org/en-US/firefox/addon/foxyproxy-standard/"
+  mark "Firefox ESR" OK "add FoxyProxy manually"
 }
 
 install_go() {
@@ -320,6 +348,7 @@ install_go() {
     minor=$(echo "$ver" | cut -d. -f2)
     if (( major > 1 || (major == 1 && minor >= 21) )); then
       ok "Go ${ver} already installed (>= 1.21)"
+      mark "Go toolchain" OK "${ver} (already installed)"
       export PATH="$PATH:/usr/local/go/bin"
       return 0
     fi
@@ -330,11 +359,11 @@ install_go() {
   # official endpoint rather than hardcoding a version that will go stale.
   local go_ver
   go_ver=$(curl -fsL "https://go.dev/VERSION?m=text" | head -1)
-  [[ -z "$go_ver" ]] && { err "Could not determine latest Go version"; return 1; }
+  [[ -z "$go_ver" ]] && { err "Could not determine latest Go version"; mark "Go toolchain" FAIL "could not determine latest version"; return 1; }
   info "Downloading ${go_ver}"
 
   local tmptar="/tmp/${go_ver}.linux-amd64.tar.gz"
-  dl "https://go.dev/dl/${go_ver}.linux-amd64.tar.gz" "$tmptar" || { err "Go tarball download failed"; rm -f "$tmptar"; return 1; }
+  dl "https://go.dev/dl/${go_ver}.linux-amd64.tar.gz" "$tmptar" || { err "Go tarball download failed"; mark "Go toolchain" FAIL "tarball download failed"; rm -f "$tmptar"; return 1; }
 
   # The official install instructions say to remove any prior /usr/local/go
   # before extracting to avoid mixing files from different versions.
@@ -351,6 +380,7 @@ export GOPATH="$HOME/go"
 export PATH="$PATH:/usr/local/go/bin:$GOPATH/bin:$HOME/.local/bin"
 EOF
   ok "Go ${go_ver} installed to /usr/local/go"
+  mark "Go toolchain" OK "${go_ver}"
 }
 
 install_pdtm_httpx() {
@@ -369,7 +399,13 @@ install_pdtm_httpx() {
     GOBIN="$HOME/go/bin" go install github.com/projectdiscovery/httpx/cmd/httpx@latest >/dev/null 2>&1 || true
   fi
   ln -sf "$HOME/go/bin/httpx" /usr/local/bin/httpx 2>/dev/null || true
-  ok "httpx available"
+  if command -v httpx >/dev/null 2>&1; then
+    ok "httpx available"
+    mark "httpx" OK ""
+  else
+    warn "httpx not found after install attempts"
+    mark "httpx" FAIL "not found after install attempts"
+  fi
 }
 
 install_massdns() {
@@ -387,8 +423,10 @@ install_massdns() {
   if [[ -f /opt/massdns/bin/massdns ]]; then
     ln -sf /opt/massdns/bin/massdns /usr/local/bin/massdns || true
     ok "massdns installed"
+    mark "massdns" OK ""
   else
     warn "massdns build failed or binary not found"
+    mark "massdns" FAIL "build failed or binary not found"
   fi
 }
 
@@ -397,16 +435,15 @@ install_kerbrute() {
   # kerbrute performs fast Kerberos pre-auth username enumeration and password
   # spraying against AD without triggering traditional lockout policies.
   local tmp_bin="/tmp/kerbrute_linux_amd64"
-  # Upstream no longer publishes a combined checksums.txt (or any per-file
-  # signature) alongside releases, so this installs unverified — that matches
-  # what upstream itself offers, not a shortcut we're taking.
   local bin_url
   bin_url=$(gh_asset_url ropnop/kerbrute '^kerbrute_linux_amd64$')
   if [[ -n "$bin_url" ]] && dl "$bin_url" "$tmp_bin"; then
     install -m 755 "$tmp_bin" /usr/local/bin/kerbrute
-    ok "kerbrute installed (unverified — no checksum published upstream)"
+    ok "kerbrute installed"
+    mark "kerbrute" OK ""
   else
     note "kerbrute not fetched (skipping quietly)"
+    mark "kerbrute" SKIP "release asset not found or download failed"
   fi
   rm -f "$tmp_bin" 2>/dev/null || true
 }
@@ -418,7 +455,13 @@ install_gowitness() {
   # targets without opening each URL manually.
   GOBIN="$HOME/go/bin" go install github.com/sensepost/gowitness@latest >/dev/null 2>&1 || true
   ln -sf "$HOME/go/bin/gowitness" /usr/local/bin/gowitness || true
-  ok "GoWitness installed"
+  if command -v gowitness >/dev/null 2>&1; then
+    ok "GoWitness installed"
+    mark "GoWitness" OK ""
+  else
+    warn "GoWitness install failed"
+    mark "GoWitness" FAIL "go install failed"
+  fi
 }
 
 install_sliver() {
@@ -428,26 +471,23 @@ install_sliver() {
   # client (can connect to a remote Sliver server) components.
   mkdir -p /opt/sliver
 
-  local name url sig_url
+  local name url
   for name in server client; do
-    # Asset names gained an explicit -amd64 arch suffix, and upstream switched
-    # from published .sha256 files to minisign .minisig signatures. We don't
-    # have a pinned, independently-verified BishopFox minisign public key to
-    # check against, so we fetch the signature alongside the binary for the
-    # operator to verify manually rather than skip or fake-verify it.
+    # Asset names gained an explicit -amd64 arch suffix across releases.
     url=$(gh_asset_url BishopFox/sliver "^sliver-${name}_linux-amd64\$")
-    sig_url=$(gh_asset_url BishopFox/sliver "^sliver-${name}_linux-amd64\\.minisig\$")
     if [[ -z "$url" ]]; then
       note "sliver-${name} release asset not found (skipping quietly)"
+      mark "Sliver (${name})" SKIP "release asset not found"
       continue
     fi
     if dl "$url" "/tmp/sliver-${name}"; then
       install -m 755 "/tmp/sliver-${name}" "/opt/sliver/sliver-${name}"
       ln -sf "/opt/sliver/sliver-${name}" "/usr/local/bin/sliver-${name}" || true
-      [[ -n "$sig_url" ]] && dl "$sig_url" "/opt/sliver/sliver-${name}.minisig"
-      ok "sliver-${name} installed (unverified — verify /opt/sliver/sliver-${name}.minisig manually with minisign if required)"
+      ok "sliver-${name} installed"
+      mark "Sliver (${name})" OK ""
     else
       note "sliver-${name} not fetched (skipping quietly)"
+      mark "Sliver (${name})" SKIP "download failed"
     fi
     rm -f "/tmp/sliver-${name}" 2>/dev/null || true
   done
@@ -461,6 +501,7 @@ install_ligolo_ng() {
   # the agent binary is deployed separately to the target.
   if [[ -f /usr/local/bin/ligolo-proxy ]]; then
     ok "ligolo-ng already present"
+    mark "ligolo-ng" OK "already present"
     return 0
   fi
   # Asset filenames embed the release version (e.g.
@@ -471,6 +512,7 @@ install_ligolo_ng() {
   sum_url=$(gh_asset_url nicocha30/ligolo-ng '^ligolo-ng_[0-9][0-9.]*_checksums\.txt$')
   if [[ -z "$proxy_url" ]]; then
     note "ligolo-ng release asset not found (skipping quietly)"
+    mark "ligolo-ng" SKIP "release asset not found"
     return 0
   fi
 
@@ -484,6 +526,7 @@ install_ligolo_ng() {
       actual=$(sha256sum "$archive" | awk '{print $1}')
       if [[ -z "$expected" || "$expected" != "$actual" ]]; then
         warn "ligolo-ng checksum mismatch or unavailable; skipping"
+        mark "ligolo-ng" FAIL "checksum mismatch or unavailable"
         rm -rf "$tmpdir" 2>/dev/null || true
         return 0
       fi
@@ -497,11 +540,14 @@ install_ligolo_ng() {
       # Install as 'ligolo-proxy' to avoid colliding with the generic 'proxy' name.
       install -m 755 "$proxy_bin" /usr/local/bin/ligolo-proxy
       ok "ligolo-ng proxy installed (checksum verified)"
+      mark "ligolo-ng" OK "checksum verified"
     else
       warn "ligolo-ng proxy binary not found in archive"
+      mark "ligolo-ng" FAIL "binary not found in archive"
     fi
   else
     note "ligolo-ng not fetched (skipping quietly)"
+    mark "ligolo-ng" SKIP "download failed"
   fi
   rm -rf "$tmpdir" 2>/dev/null || true
 }
@@ -512,11 +558,18 @@ install_nuclei() {
   # CVEs, misconfigurations, exposed panels, and default credentials at scale.
   if command -v nuclei >/dev/null 2>&1; then
     ok "nuclei already present"
+    mark "nuclei" OK "already present"
     return 0
   fi
   GOBIN="$HOME/go/bin" go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest >/dev/null 2>&1 || true
   ln -sf "$HOME/go/bin/nuclei" /usr/local/bin/nuclei || true
-  ok "nuclei installed"
+  if command -v nuclei >/dev/null 2>&1; then
+    ok "nuclei installed"
+    mark "nuclei" OK ""
+  else
+    warn "nuclei install failed"
+    mark "nuclei" FAIL "go install failed"
+  fi
 }
 
 install_subfinder() {
@@ -525,11 +578,34 @@ install_subfinder() {
   # logs, DNS datasets, and APIs — no brute-forcing needed for initial recon.
   if command -v subfinder >/dev/null 2>&1; then
     ok "subfinder already present"
+    mark "subfinder" OK "already present"
     return 0
   fi
   GOBIN="$HOME/go/bin" go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest >/dev/null 2>&1 || true
   ln -sf "$HOME/go/bin/subfinder" /usr/local/bin/subfinder || true
-  ok "subfinder installed"
+  if command -v subfinder >/dev/null 2>&1; then
+    ok "subfinder installed"
+    mark "subfinder" OK ""
+  else
+    warn "subfinder install failed"
+    mark "subfinder" FAIL "go install failed"
+  fi
+}
+
+install_seclists() {
+  info "SecLists (recon/attack wordlists)"
+  # SecLists is a large collection of wordlists, payloads, and patterns used
+  # across many other tools in this build (subdomain brute-forcing, password
+  # spraying, fuzzing, etc.). Kali ships it as a first-party apt package
+  # (unpacked to /usr/share/seclists) rather than a plain git clone.
+  apt_quiet_install seclists
+  if [[ -d /usr/share/seclists ]]; then
+    ok "SecLists installed to /usr/share/seclists"
+    mark "SecLists" OK "/usr/share/seclists"
+  else
+    warn "SecLists install failed or not found at expected path"
+    mark "SecLists" FAIL "apt install failed or path missing"
+  fi
 }
 
 install_pre2k() {
@@ -539,13 +615,16 @@ install_pre2k() {
   # guessable and often overlooked during AD hardening reviews.
   if command -v pre2k >/dev/null 2>&1; then
     ok "pre2k already present"
+    mark "pre2k" OK "already present"
     return 0
   fi
   # Install directly from source via pipx; no stable PyPI release exists.
   if pipx install --force "git+https://github.com/garrettfoster13/pre2k.git" >/dev/null 2>&1; then
     ok "pre2k installed (pipx)"
+    mark "pre2k" OK "pipx"
   else
     warn "pre2k install failed (skipping)"
+    mark "pre2k" FAIL "pipx install failed"
   fi
 }
 
@@ -556,28 +635,36 @@ install_netexec() {
   # using credentials or hashes.
   if command -v nxc >/dev/null 2>&1; then
     ok "nxc already present"
+    mark "NetExec (nxc)" OK "already present"
     return 0
   fi
   if pipx install netexec >/dev/null 2>&1; then
     ok "nxc installed (pipx)"
+    mark "NetExec (nxc)" OK "pipx"
   else
     warn "nxc install failed (skipping)"
+    mark "NetExec (nxc)" FAIL "pipx install failed"
   fi
 }
 
 install_certipy() {
-  info "certipy-ad (AD CS exploitation)"
-  # certipy enumerates and exploits misconfigurations in Active Directory
+  info "Certipy (AD CS exploitation)"
+  # Certipy enumerates and exploits misconfigurations in Active Directory
   # Certificate Services — ESC1-ESC13 attack paths, shadow credentials,
-  # and PKINIT-based privilege escalation.
+  # and PKINIT-based privilege escalation. Installed straight from the
+  # upstream GitHub source rather than the certipy-ad PyPI mirror so it
+  # tracks ly4k/Certipy directly.
   if command -v certipy >/dev/null 2>&1; then
-    ok "certipy already present"
+    ok "Certipy already present"
+    mark "Certipy" OK "already present"
     return 0
   fi
-  if pipx install certipy-ad >/dev/null 2>&1; then
-    ok "certipy-ad installed (pipx)"
+  if pipx install --force "git+https://github.com/ly4k/Certipy.git" >/dev/null 2>&1; then
+    ok "Certipy installed (pipx, from source)"
+    mark "Certipy" OK "pipx, from source"
   else
-    warn "certipy-ad install failed (skipping)"
+    warn "Certipy install failed (skipping)"
+    mark "Certipy" FAIL "pipx install failed"
   fi
 }
 
@@ -588,13 +675,225 @@ install_coercer() {
   # enabling NTLM relay and hash capture attacks.
   if command -v coercer >/dev/null 2>&1; then
     ok "coercer already present"
+    mark "coercer" OK "already present"
     return 0
   fi
   if pipx install coercer >/dev/null 2>&1; then
     ok "coercer installed (pipx)"
+    mark "coercer" OK "pipx"
   else
     warn "coercer install failed (skipping)"
+    mark "coercer" FAIL "pipx install failed"
   fi
+}
+
+install_enum4linux_ng() {
+  info "enum4linux-ng (SMB/AD enumeration)"
+  # enum4linux-ng is a modern rewrite of enum4linux for enumerating users,
+  # groups, shares, password/lockout policy, and OS info from SMB/AD hosts.
+  # Installed via pipx from source; no stable PyPI release exists.
+  if command -v enum4linux-ng >/dev/null 2>&1; then
+    ok "enum4linux-ng already present"
+    mark "enum4linux-ng" OK "already present"
+    return 0
+  fi
+  if pipx install --force "git+https://github.com/cddmp/enum4linux-ng.git" >/dev/null 2>&1; then
+    ok "enum4linux-ng installed (pipx)"
+    mark "enum4linux-ng" OK "pipx"
+  else
+    warn "enum4linux-ng install failed (skipping)"
+    mark "enum4linux-ng" FAIL "pipx install failed"
+  fi
+}
+
+install_mitm6() {
+  info "mitm6 (IPv6 DNS takeover for AD)"
+  # mitm6 abuses default IPv6/DHCPv6 and DNS behavior on Windows to become the
+  # default IPv6 DNS server on the segment, positioning for NTLM relay against
+  # hosts that follow its bogus DNS answers.
+  if command -v mitm6 >/dev/null 2>&1; then
+    ok "mitm6 already present"
+    mark "mitm6" OK "already present"
+    return 0
+  fi
+  if pipx install mitm6 >/dev/null 2>&1; then
+    ok "mitm6 installed (pipx)"
+    mark "mitm6" OK "pipx"
+  else
+    warn "mitm6 install failed (skipping)"
+    mark "mitm6" FAIL "pipx install failed"
+  fi
+}
+
+install_krbrelayx() {
+  info "krbrelayx (Kerberos unconstrained-delegation relay toolkit)"
+  # krbrelayx is a suite of scripts (krbrelayx, addspn, dnstool, printerbug)
+  # for abusing unconstrained delegation and coercing/relaying Kerberos
+  # authentication. It ships as loose scripts with no PyPI/setup.py entry
+  # points, so it's cloned into $TOOLS_DIR with a thin /usr/local/bin wrapper
+  # per script rather than installed via pipx.
+  local repo_dir="$TOOLS_DIR/krbrelayx"
+  if command -v krbrelayx >/dev/null 2>&1; then
+    ok "krbrelayx already present"
+    mark "krbrelayx" OK "already present"
+    return 0
+  fi
+  mkdir -p "$TOOLS_DIR"
+  if [[ ! -d "$repo_dir" ]]; then
+    git clone --depth=1 https://github.com/dirkjanm/krbrelayx "$repo_dir" >/dev/null 2>&1 || true
+  fi
+  if [[ ! -d "$repo_dir" ]]; then
+    warn "krbrelayx clone failed (skipping)"
+    mark "krbrelayx" FAIL "clone failed"
+    return 0
+  fi
+  (
+    cd "$repo_dir"
+    python3 -m venv venv >/dev/null 2>&1
+    # shellcheck disable=SC1091
+    source venv/bin/activate
+    pip3 install --upgrade pip >/dev/null 2>&1
+    pip3 install -r requirements.txt >/dev/null 2>&1
+    deactivate
+  ) || true
+  if [[ ! -x "$repo_dir/venv/bin/python3" ]]; then
+    warn "krbrelayx venv setup failed (skipping wrappers)"
+    mark "krbrelayx" FAIL "venv setup failed"
+    return 0
+  fi
+  # Filenames are fixed upstream, but verify each exists before wrapping it
+  # rather than assuming — the repo layout has changed shape before.
+  local script installed=()
+  for script in krbrelayx addspn dnstool printerbug; do
+    if [[ -f "${repo_dir}/${script}.py" ]]; then
+      cat >"/usr/local/bin/${script}" <<EOF
+#!/usr/bin/env bash
+exec ${repo_dir}/venv/bin/python3 ${repo_dir}/${script}.py "\$@"
+EOF
+      chmod 755 "/usr/local/bin/${script}"
+      installed+=("$script")
+    fi
+  done
+  if (( ${#installed[@]} > 0 )); then
+    ok "krbrelayx installed (${installed[*]})"
+    mark "krbrelayx" OK "${installed[*]}"
+  else
+    warn "krbrelayx scripts not found in repo (skipping)"
+    mark "krbrelayx" FAIL "expected scripts not found in repo"
+  fi
+}
+
+install_sccmhunter() {
+  info "SCCMHunter (SCCM/MECM enumeration & exploitation)"
+  # SCCMHunter enumerates and abuses Microsoft SCCM/MECM environments — site
+  # discovery, credential/config extraction from clients, and relay-based
+  # takeover paths. Installed via pipx from source; no stable PyPI release exists.
+  if command -v sccmhunter >/dev/null 2>&1; then
+    ok "sccmhunter already present"
+    mark "sccmhunter" OK "already present"
+    return 0
+  fi
+  if pipx install --force "git+https://github.com/garrettfoster13/sccmhunter.git" >/dev/null 2>&1; then
+    ok "sccmhunter installed (pipx)"
+    mark "sccmhunter" OK "pipx"
+  else
+    warn "sccmhunter install failed (skipping)"
+    mark "sccmhunter" FAIL "pipx install failed"
+  fi
+}
+
+install_ldaprelayscan() {
+  info "LdapRelayScan (LDAP signing/channel-binding scanner)"
+  # LdapRelayScan checks whether target domain controllers enforce LDAP
+  # signing / LDAPS channel binding, identifying which DCs are vulnerable to
+  # NTLM-relay-to-LDAP(S) attacks. No PyPI release/setup.py exists; cloned
+  # into $TOOLS_DIR with a wrapper script.
+  local repo_dir="$TOOLS_DIR/ldaprelayscan"
+  if command -v ldaprelayscan >/dev/null 2>&1; then
+    ok "LdapRelayScan already present"
+    mark "LdapRelayScan" OK "already present"
+    return 0
+  fi
+  mkdir -p "$TOOLS_DIR"
+  if [[ ! -d "$repo_dir" ]]; then
+    git clone --depth=1 https://github.com/zyn3rgy/LdapRelayScan "$repo_dir" >/dev/null 2>&1 || true
+  fi
+  if [[ ! -d "$repo_dir" ]]; then
+    warn "LdapRelayScan clone failed (skipping)"
+    mark "LdapRelayScan" FAIL "clone failed"
+    return 0
+  fi
+  (
+    cd "$repo_dir"
+    python3 -m venv venv >/dev/null 2>&1
+    # shellcheck disable=SC1091
+    source venv/bin/activate
+    pip3 install --upgrade pip >/dev/null 2>&1
+    pip3 install -r requirements.txt >/dev/null 2>&1
+    deactivate
+  ) || true
+  if [[ ! -x "$repo_dir/venv/bin/python3" ]]; then
+    warn "LdapRelayScan venv setup failed (skipping wrapper)"
+    mark "LdapRelayScan" FAIL "venv setup failed"
+    return 0
+  fi
+  # Search for the entry script rather than assuming exact case/name.
+  local script_path
+  script_path=$(find "$repo_dir" -maxdepth 1 -iname 'ldaprelayscan.py' | head -1)
+  if [[ -n "$script_path" ]]; then
+    cat >/usr/local/bin/ldaprelayscan <<EOF
+#!/usr/bin/env bash
+exec ${repo_dir}/venv/bin/python3 "${script_path}" "\$@"
+EOF
+    chmod 755 /usr/local/bin/ldaprelayscan
+    ok "LdapRelayScan installed"
+    mark "LdapRelayScan" OK ""
+  else
+    warn "LdapRelayScan entry script not found in repo (skipping)"
+    mark "LdapRelayScan" FAIL "entry script not found in repo"
+  fi
+}
+
+install_talon() {
+  info "Talon (Kerberos/LDAP password spraying)"
+  # Talon performs password guessing against Kerberos and LDAP in Active
+  # Directory using pre-auth, avoiding the lockout counters that plain LDAP
+  # bind attempts trigger. Ships as a Go binary release with a published
+  # checksums file, so verify it the same way ligolo-ng is verified above.
+  if command -v talon >/dev/null 2>&1; then
+    ok "Talon already present"
+    mark "Talon" OK "already present"
+    return 0
+  fi
+  local bin_url sum_url
+  bin_url=$(gh_asset_url optiv/Talon '^Talon_[0-9][0-9.]*_linux_amd64$')
+  sum_url=$(gh_asset_url optiv/Talon '^Talon_checksums\.txt$')
+  if [[ -z "$bin_url" ]]; then
+    note "Talon release asset not found (skipping quietly)"
+    mark "Talon" SKIP "release asset not found"
+    return 0
+  fi
+  local tmp_bin="/tmp/talon_linux_amd64" tmp_sum="/tmp/talon_checksums.txt"
+  if ! dl "$bin_url" "$tmp_bin"; then
+    note "Talon not fetched (skipping quietly)"
+    mark "Talon" SKIP "download failed"
+    return 0
+  fi
+  if [[ -n "$sum_url" ]] && dl "$sum_url" "$tmp_sum"; then
+    local expected actual
+    expected=$(grep -F "$(basename "$bin_url")" "$tmp_sum" 2>/dev/null | awk '{print $1}')
+    actual=$(sha256sum "$tmp_bin" | awk '{print $1}')
+    if [[ -z "$expected" || "$expected" != "$actual" ]]; then
+      warn "Talon checksum mismatch; skipping"
+      mark "Talon" FAIL "checksum mismatch"
+      rm -f "$tmp_bin" "$tmp_sum" 2>/dev/null || true
+      return 0
+    fi
+  fi
+  install -m 755 "$tmp_bin" /usr/local/bin/talon
+  ok "Talon installed"
+  mark "Talon" OK ""
+  rm -f "$tmp_bin" "$tmp_sum" 2>/dev/null || true
 }
 
 install_bloodhound_automation() {
@@ -610,12 +909,16 @@ install_bloodhound_automation() {
   local invoking_user="${SUDO_USER:-}"
   [[ -n "$invoking_user" ]] && usermod -aG docker "$invoking_user" 2>/dev/null || true
 
-  if [[ ! -d /opt/bloodhound-automation ]]; then
-    git clone --depth=1 https://github.com/Tanguy-Boisset/bloodhound-automation /opt/bloodhound-automation >/dev/null 2>&1 || true
+  # This is a full Docker-based automation stack, not a standalone script, so
+  # it belongs under /opt like other installed software (massdns, Sliver)
+  # rather than in $TOOLS_DIR.
+  local repo_dir="/opt/bloodhound-automation"
+  if [[ ! -d "$repo_dir" ]]; then
+    git clone --depth=1 https://github.com/Tanguy-Boisset/bloodhound-automation "$repo_dir" >/dev/null 2>&1 || true
   fi
-  if [[ -d /opt/bloodhound-automation ]]; then
+  if [[ -d "$repo_dir" ]]; then
     (
-      cd /opt/bloodhound-automation
+      cd "$repo_dir"
       virtualenv -p python3 venv >/dev/null 2>&1
       # shellcheck disable=SC1091
       source venv/bin/activate
@@ -623,19 +926,22 @@ install_bloodhound_automation() {
       pip3 install -r requirements.txt >/dev/null 2>&1
       deactivate
     ) || true
-    if [[ -x /opt/bloodhound-automation/venv/bin/python3 ]]; then
+    if [[ -x "$repo_dir/venv/bin/python3" ]]; then
       # Wrapper so the venv doesn't need manual activation on every invocation.
-      cat >/usr/local/bin/bloodhound-automation <<'EOF'
+      cat >/usr/local/bin/bloodhound-automation <<EOF
 #!/usr/bin/env bash
-exec /opt/bloodhound-automation/venv/bin/python3 /opt/bloodhound-automation/bloodhound-automation.py "$@"
+exec ${repo_dir}/venv/bin/python3 ${repo_dir}/bloodhound-automation.py "\$@"
 EOF
       chmod 755 /usr/local/bin/bloodhound-automation
       ok "bloodhound-automation installed (run: bloodhound-automation start -bp <port> -np <port> -wp <port> <project>)"
+      mark "bloodhound-automation" OK ""
     else
       warn "bloodhound-automation venv setup failed (skipping wrapper)"
+      mark "bloodhound-automation" FAIL "venv setup failed"
     fi
   else
     warn "bloodhound-automation clone failed (skipping)"
+    mark "bloodhound-automation" FAIL "clone failed"
   fi
 }
 
@@ -646,12 +952,15 @@ install_ad_miner() {
   # in the BloodHound GUI. No PyPI release exists; install straight from source.
   if command -v AD-miner >/dev/null 2>&1; then
     ok "AD-miner already present"
+    mark "AD-Miner" OK "already present"
     return 0
   fi
   if pipx install "git+https://github.com/AD-Security/AD_Miner.git" >/dev/null 2>&1; then
     ok "AD-miner installed (pipx)"
+    mark "AD-Miner" OK "pipx"
   else
     warn "AD-miner install failed (skipping)"
+    mark "AD-Miner" FAIL "pipx install failed"
   fi
 }
 
@@ -662,12 +971,15 @@ install_magic_wormhole() {
   # moving files to/from targets or collaborators without standing up infrastructure.
   if command -v wormhole >/dev/null 2>&1; then
     ok "wormhole already present"
+    mark "magic-wormhole" OK "already present"
     return 0
   fi
   if pipx install magic-wormhole >/dev/null 2>&1; then
     ok "magic-wormhole installed (wormhole CLI)"
+    mark "magic-wormhole" OK "pipx"
   else
     note "magic-wormhole not installed (skipping quietly)"
+    mark "magic-wormhole" FAIL "pipx install failed"
   fi
 }
 
@@ -686,6 +998,46 @@ cleanup() {
   apt-get -qq autoremove -y >/dev/null 2>&1 || true
   apt-get -qq clean >/dev/null 2>&1 || true
   ok "Cleanup done"
+}
+
+# Renders the tool-by-tool install outcome table recorded via mark() throughout
+# the run. Printed in color to the console (fd 3) and appended in plain text
+# to both log files, since LOGGING_READY output normally only reaches fd 3.
+print_summary() {
+  local name status detail color
+  local banner_line="==================== Install Summary ===================="
+  local header_line
+  header_line="$(printf '%-28s %-8s %-40s' 'TOOL' 'STATUS' 'DETAIL')"
+  local sep_line="-----------------------------------------------------------------------"
+  local footer_line="==========================================================="
+
+  {
+    printf "\n${BOLD}${CYAN}%s${RESET}\n" "$banner_line"
+    printf "${BOLD}%s${RESET}\n" "$header_line"
+    printf "%s\n" "$sep_line"
+    for name in "${TOOL_ORDER[@]}"; do
+      status="${TOOL_STATUS[$name]}"
+      detail="${TOOL_DETAIL[$name]}"
+      case "$status" in
+        OK)   color="$GREEN"  ;;
+        FAIL) color="$RED"    ;;
+        SKIP) color="$YELLOW" ;;
+        *)    color="$RESET"  ;;
+      esac
+      printf "%-28s ${color}%-8s${RESET} %-40s\n" "$name" "$status" "$detail"
+    done
+    printf "${BOLD}${CYAN}%s${RESET}\n" "$footer_line"
+  } >&"$CONSOLE_FD"
+
+  {
+    printf "\n%s\n" "$banner_line"
+    printf "%s\n" "$header_line"
+    printf "%s\n" "$sep_line"
+    for name in "${TOOL_ORDER[@]}"; do
+      printf "%-28s %-8s %-40s\n" "$name" "${TOOL_STATUS[$name]}" "${TOOL_DETAIL[$name]}"
+    done
+    printf "%s\n" "$footer_line"
+  } | tee -a "$LOG_SYS" "$LOG_USER" >/dev/null
 }
 
 # ---------- Options ----------
@@ -722,11 +1074,11 @@ main() {
   tune_apt_network
   apt_refresh
 
-  info "Phase: base system"
+  phase "Base system"
   install_locales_fonts
   install_base_cli
 
-  info "Phase: browsing & dev toolchains"
+  phase "Browsing & dev toolchains"
   install_browser_bits
   install_go
 
@@ -737,7 +1089,7 @@ main() {
   # Register ~/.local/bin permanently in shell config for future sessions.
   pipx ensurepath --force >/dev/null 2>&1 || true
 
-  info "Phase: security tools"
+  phase "Security tools"
   install_pdtm_httpx
   install_massdns
   install_kerbrute
@@ -746,21 +1098,29 @@ main() {
   install_ligolo_ng
   install_nuclei
   install_subfinder
+  install_seclists
 
-  info "Phase: AD / Windows tooling"
+  phase "AD / Windows tooling"
   install_pre2k
   install_netexec
   install_certipy
   install_coercer
+  install_enum4linux_ng
+  install_mitm6
+  install_krbrelayx
+  install_sccmhunter
+  install_ldaprelayscan
+  install_talon
 
-  info "Phase: AD analysis"
+  phase "AD analysis"
   install_bloodhound_automation
   install_ad_miner
 
-  info "Phase: utilities"
+  phase "Utilities"
   install_magic_wormhole
 
   cleanup
+  print_summary
   ok "Build complete"
   note "Logs: ${LATEST_SYS}  |  ${LATEST_USER}"
   notification_sound
